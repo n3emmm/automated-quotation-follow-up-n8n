@@ -1,0 +1,14 @@
+# Local credentials and runtime files
+.env
+.env.*
+!.env.example
+*.sqlite
+*.db
+.n8n/
+node_modules/
+__pycache__/
+.pytest_cache/
+.DS_Store
+# Private exports must be reviewed before sharing
+private/
+secrets/

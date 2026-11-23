@@ -1,0 +1,540 @@
+{
+  "name": "Automated Quotation Follow-up System V2",
+  "nodes": [
+    {
+      "name": "Manual start",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "id": "fc61e04c-4d70-4eb0-9a82-c33be9d3d95c",
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "name": "09 AM Amman",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "id": "d35e01fa-b578-41d7-8ebf-1b8f31338320",
+      "position": [
+        0,
+        190
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 9,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "disabled": true
+    },
+    {
+      "name": "Configuration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "id": "52009dbc-72d1-4681-a63b-803fe237fc3f",
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Change these values only in a private copy after completing setup.\nconst cfg = {\n  live: false,\n  spreadsheetId: '',\n  whatsappEnabled: false,\n  graphVersion: '',\n  phoneNumberId: '',\n  ownerPhone: '',\n  templateName: '', // Approved template with three body variables, or blank for free-form text.\n  templateLanguage: 'en_US',\n};\nif (!cfg.live) throw new Error('Live access is disabled. Run the offline tests or configure a private staging copy.');\nif (!/^[\\w-]{15,}$/.test(cfg.spreadsheetId)) throw new Error('Configure the spreadsheet ID.');\nif (cfg.whatsappEnabled && (!/^v\\d+\\.\\d+$/.test(cfg.graphVersion) ||\n    !/^\\d+$/.test(cfg.phoneNumberId) || !/^[1-9]\\d{6,14}$/.test(cfg.ownerPhone))) {\n  throw new Error('Configure the Graph version, phone number ID and international owner number (digits only).');\n}\nreturn [{json: {...cfg, today: $now.setZone('Asia/Amman').toISODate()}}];\n"
+      }
+    },
+    {
+      "name": "Read Quotes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "id": "c5c0af40-212d-45ac-b6d7-faf978b50f72",
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://sheets.googleapis.com/v4/spreadsheets/' + $('Configuration').first().json.spreadsheetId + '/values/Quotes!A1:L' }}",
+        "authentication": "predefinedCredentialType",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": false,
+              "neverError": false,
+              "responseFormat": "json"
+            }
+          }
+        },
+        "nodeCredentialType": "googleSheetsOAuth2Api"
+      }
+    },
+    {
+      "name": "Validate rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "id": "53dc3ca2-78e3-44a7-9aff-b587e484011f",
+      "position": [
+        700,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const headers = ['quote_id','customer_name','customer_email','amount','follow_up_date','status','draft_id','alert_status','error_message','draft_guard','alert_attempts','wa_message_id'];\nconst values = $json.values;\nif (!Array.isArray(values) || !headers.every((h,i) => values[0]?.[i] === h)) {\n  throw new Error('Quotes!A1:L1 must match the documented headers in order.');\n}\nconst cfg = $('Configuration').first().json;\nconst rows = values.slice(1).map((cells,i) => ({\n  row: i+2, ...Object.fromEntries(headers.map((h,j) => [h, String(cells[j] ?? '').trim()]))\n})).filter(r => headers.some(h => r[h]));\nconst counts = new Map();\nfor (const r of rows) {\n  const key = r.quote_id.toLowerCase();\n  counts.set(key, (counts.get(key) || 0) + 1);\n}\nreturn rows.map(r => {\n  const id = r.quote_id;\n  const status = r.status.toLowerCase();\n  const alert = r.alert_status.toLowerCase();\n  let action = 'done', outcome = 'skipped', reason = '';\n  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/.test(id)) reason = 'Missing or unsupported quote ID';\n  else if (counts.get(id.toLowerCase()) > 1) reason = 'Duplicate quote ID';\n  else if (['closed','cancelled','canceled','accepted','rejected','sent','won','lost'].includes(status)) { /* terminal */ }\n  else if (!['pending','draft created'].includes(status)) reason = 'Unknown quote status';\n  else if (status === 'draft created' && !r.draft_id) reason = 'Draft Created without a draft ID';\n  else if (status === 'pending' && r.draft_id) reason = 'Pending with a recorded draft ID';\n  else if (status === 'draft created') {\n    if (['sent','accepted'].includes(alert) || !cfg.whatsappEnabled) { /* complete or paused */ }\n    else if (!['queued','retry'].includes(alert)) reason = (['auth blocked','sending','review'].includes(alert) && r.error_message) || 'Review alert history before authorizing Retry';\n    else if (!/^([0-2])$/.test(r.alert_attempts || '0')) reason = 'Review alert attempt count';\n    else if (r.wa_message_id) reason = 'Provider ID already present; verify before retry';\n    else action = 'claimAlert';\n  } else if (alert || r.wa_message_id || r.alert_attempts && r.alert_attempts !== '0') reason = 'Unexpected alert state on pending quote';\n  else if (r.draft_guard && r.draft_guard !== 'Reserved') reason = 'Unknown draft guard';\n  else if (!r.customer_name || !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+$/.test(r.customer_email)) reason = 'Invalid customer name or email';\n  else {\n    const date = r.follow_up_date;\n    const instant = new Date(date + 'T00:00:00Z');\n    if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(date) || !Number.isFinite(+instant) || instant.toISOString().slice(0,10) !== date) reason = 'Invalid ISO calendar date';\n    else if (date <= cfg.today || r.draft_guard === 'Reserved') action = 'search';\n  }\n  if (reason) {\n    outcome = 'review';\n    if (reason !== r.error_message) action = 'write';\n  }\n  return {json: {...r, action, outcome, reason, patch: reason ? {error_message:reason} : {},\n    after:'done', subject:'Follow-up on Quotation QFUP-' + id}, pairedItem:{item:0}};\n});\n"
+      }
+    },
+    {
+      "name": "One quotation",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "id": "bf8cc1fe-06d7-45ab-b17d-47b4cc802f77",
+      "position": [
+        920,
+        0
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "name": "Run result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "id": "0266754a-f59d-453d-9c87-538fa9046cdf",
+      "position": [
+        1150,
+        -200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst issues = rows.filter(r => ['failure','review','retry'].includes(r.outcome));\nif (issues.length) throw new Error(issues.length + ' row(s) need attention. ' + issues.slice(0,20).map(r => 'row ' + r.row + ' — ' + r.reason).join(' | '));\nreturn [{json:{total:rows.length, processed:rows.filter(r => r.outcome === 'processed').length, skipped:rows.filter(r => r.outcome === 'skipped').length}}];"
+      }
+    },
+    {
+      "name": "Dispatch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "id": "d7076c57-862a-4597-bab0-9c3598b1a24e",
+      "position": [
+        1170,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const s = {...$json};\nif (s.action === 'claimAlert') {\n  s.patch = {alert_status:'Sending', alert_attempts:String(Number(s.alert_attempts || 0)+1), error_message:''};\n  s.action = 'write';\n  s.after = 'notify';\n}\nif (s.action === 'write') {\n  const cols = {status:'F',draft_id:'G',alert_status:'H',error_message:'I',draft_guard:'J',alert_attempts:'K',wa_message_id:'L'};\n  s.writeBody = {valueInputOption:'RAW', data:Object.entries(s.patch).map(([k,v]) => {\n    if (!cols[k]) throw new Error('Unsupported field');\n    return {range:'Quotes!' + cols[k] + s.row, values:[[v]]};\n  })};\n}\nif (s.action === 'create') {\n  const body = 'Dear ' + s.customer_name + ',\\n\\nI am following up on our quotation ' + s.quote_id +\n    '. Please let us know if you have any questions or would like us to adjust the quotation.\\n\\nBest regards,\\nSales Team';\n  const mime = ['To: ' + s.customer_email,'Subject: ' + s.subject,'MIME-Version: 1.0',\n    'Content-Type: text/plain; charset=UTF-8','Content-Transfer-Encoding: base64','',\n    Buffer.from(body,'utf8').toString('base64').match(/.{1,76}/g).join('\\r\\n')].join('\\r\\n');\n  s.createBody = {message:{raw:Buffer.from(mime).toString('base64url')}};\n}\nif (s.action === 'notify') {\n  const cfg = $('Configuration').first().json;\n  const args = [s.quote_id, s.customer_name || 'Customer', s.amount || 'Unspecified'];\n  s.notifyBody = {messaging_product:'whatsapp', to:cfg.ownerPhone};\n  if (cfg.templateName) {\n    Object.assign(s.notifyBody,{type:'template',template:{name:cfg.templateName, language:{code:cfg.templateLanguage},\n      components:[{type:'body',parameters:args.map(text => ({type:'text',text}))}]}});\n  } else {\n    Object.assign(s.notifyBody,{type:'text',text:{body:'Quotation follow-up draft ready. Quote: ' + args[0] +\n      '\\nCustomer: ' + args[1] + '\\nAmount: ' + args[2]}});\n  }\n}\nreturn {json:s};\n"
+      }
+    },
+    {
+      "name": "Next operation",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "id": "cc95f827-0eb4-445a-825f-ef1535fa49cb",
+      "position": [
+        1410,
+        160
+      ],
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 6,
+        "output": "={{ ['search', 'inspect', 'write', 'create', 'notify', 'done'].indexOf($json.action) }}"
+      }
+    },
+    {
+      "name": "Search drafts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "id": "afbc92bd-536b-4373-a644-1e5f18eb9edd",
+      "position": [
+        1680,
+        -260
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+        "authentication": "predefinedCredentialType",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        },
+        "nodeCredentialType": "gmailOAuth2",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ 'subject:\"' + $json.subject + '\"' }}"
+            },
+            {
+              "name": "maxResults",
+              "value": "2"
+            }
+          ]
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "name": "Inspect candidate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "id": "23856225-ade7-4246-b05f-b61e705fd7ed",
+      "position": [
+        1680,
+        -70
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://gmail.googleapis.com/gmail/v1/users/me/drafts/' + encodeURIComponent($json.candidate) }}",
+        "authentication": "predefinedCredentialType",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        },
+        "nodeCredentialType": "gmailOAuth2",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "format",
+              "value": "full"
+            },
+            {
+              "name": "fields",
+              "value": "id,message(payload(headers))"
+            }
+          ]
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "name": "Persist checkpoint",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "id": "a82b8afb-f123-4d50-b4ed-b051d7b51ada",
+      "position": [
+        1680,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://sheets.googleapis.com/v4/spreadsheets/' + $('Configuration').first().json.spreadsheetId + '/values:batchUpdate' }}",
+        "authentication": "predefinedCredentialType",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        },
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.writeBody }}"
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "name": "Create draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "id": "5974dfe6-733a-4562-b5d1-7e8367bd7497",
+      "position": [
+        1680,
+        310
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+        "authentication": "predefinedCredentialType",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        },
+        "nodeCredentialType": "gmailOAuth2",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.createBody }}"
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "name": "Notify owner",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "id": "829558e9-ea44-4e1c-a1fc-2d0c1fad8077",
+      "position": [
+        1680,
+        500
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://graph.facebook.com/' + $('Configuration').first().json.graphVersion + '/' + $('Configuration').first().json.phoneNumberId + '/messages' }}",
+        "authentication": "genericCredentialType",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        },
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.notifyBody }}"
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "name": "Apply result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "id": "13ca6d37-09c8-4a03-9e11-915c3558f866",
+      "position": [
+        1940,
+        125
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const s = {...$('Dispatch').item.json};\nconst {statusCode, body} = $json;\nconst ok = statusCode >= 200 && statusCode < 300;\nconst cfg = $('Configuration').first().json;\nfunction finish(outcome, reason='') { Object.assign(s,{action:'done',outcome,reason}); }\nfunction write(patch, after='done', outcome='processed') {\n  Object.assign(s,{action:'write', patch, after, outcome, reason:patch.error_message || ''});\n}\nfunction review(reason) { write({error_message:reason},'done','review'); }\nfunction record(id) {\n  write({status:'Draft Created',draft_id:id,draft_guard:'',alert_status:'Queued',error_message:''},\n    cfg.whatsappEnabled ? 'claimAlert' : 'done');\n}\nswitch (s.action) {\n  case 'write':\n    if (!ok || body?.totalUpdatedCells !== Object.keys(s.patch).length) finish('failure','Sheet write unconfirmed; inspect row and start a fresh run');\n    else { Object.assign(s,s.patch); s.action = s.after; }\n    break;\n  case 'search': {\n    if (!ok || !body || typeof body !== 'object' || Array.isArray(body) ||\n        (body.drafts !== undefined && !Array.isArray(body.drafts))) { review('Gmail search failed; retry on next run'); break; }\n    const candidates = body.drafts || [];\n    if (body.nextPageToken || candidates.length > 1) review('Multiple draft candidates; reconcile manually');\n    else if (candidates.length === 1 && candidates[0]?.id) { s.candidate = candidates[0].id; s.action = 'inspect'; }\n    else if (candidates.length) review('Invalid Gmail draft reference');\n    else if (s.draft_guard) review('Reserved draft missing; check mailbox and execution before clearing guard');\n    else write({draft_guard:'Reserved',error_message:''},'create');\n    break;\n  }\n  case 'inspect': {\n    const headers = body?.message?.payload?.headers || [];\n    const vals = name => headers.filter(h => h.name.toLowerCase() === name).map(h => h.value.trim());\n    const to = vals('to'), subj = vals('subject');\n    const addr = to[0]?.match(/^[^<>,;]*<([^<>,;]+)>$/)?.[1] || to[0];\n    if (ok && body.id === s.candidate && subj.length === 1 && subj[0] === s.subject && to.length === 1 &&\n        addr?.toLowerCase() === s.customer_email.toLowerCase() && !vals('cc').length && !vals('bcc').length) record(body.id);\n    else review('Draft ownership unverified; check exact subject and recipient');\n    break;\n  }\n  case 'create':\n    if (ok && typeof body?.id === 'string' && body.id) record(body.id);\n    else review('Draft creation unconfirmed; reservation retained');\n    break;\n  case 'notify': {\n    const code = Number(body?.error?.code);\n    const mid = body?.messages?.[0]?.id;\n    if (ok && typeof mid === 'string' && mid) write({alert_status:'Accepted',wa_message_id:mid,error_message:''});\n    else {\n      let state = 'Review', msg = 'Delivery outcome uncertain; reconcile before retry';\n      if (code === 190 || statusCode === 401) { state = 'Auth Blocked'; msg = 'Replace or renew the private WhatsApp credential; then reset to Retry'; }\n      else if ((statusCode === 429 || [130429,131056,4,80007].includes(code)) && Number(s.alert_attempts)<3) {\n        state = 'Retry'; msg = 'Rate limited; retry on a subsequent daily run';\n      } else if (code && statusCode >= 400 && statusCode < 500) msg = 'WhatsApp rejected request; review Meta code ' + code;\n      write({alert_status:state,error_message:msg},'done',state === 'Retry' ? 'retry' : 'review');\n    }\n    break;\n  }\n  default: throw new Error('Unexpected response');\n}\ndelete s.notifyBody;\ndelete s.createBody;\ndelete s.writeBody;\nreturn {json:s};\n"
+      }
+    }
+  ],
+  "connections": {
+    "Manual start": {
+      "main": [
+        [
+          {
+            "node": "Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 AM Amman": {
+      "main": [
+        [
+          {
+            "node": "Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuration": {
+      "main": [
+        [
+          {
+            "node": "Read Quotes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Quotes": {
+      "main": [
+        [
+          {
+            "node": "Validate rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate rows": {
+      "main": [
+        [
+          {
+            "node": "One quotation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One quotation": {
+      "main": [
+        [
+          {
+            "node": "Run result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dispatch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch": {
+      "main": [
+        [
+          {
+            "node": "Next operation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Next operation": {
+      "main": [
+        [
+          {
+            "node": "Search drafts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Inspect candidate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Persist checkpoint",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create draft",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify owner",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "One quotation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search drafts": {
+      "main": [
+        [
+          {
+            "node": "Apply result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inspect candidate": {
+      "main": [
+        [
+          {
+            "node": "Apply result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist checkpoint": {
+      "main": [
+        [
+          {
+            "node": "Apply result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create draft": {
+      "main": [
+        [
+          {
+            "node": "Apply result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify owner": {
+      "main": [
+        [
+          {
+            "node": "Apply result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply result": {
+      "main": [
+        [
+          {
+            "node": "Dispatch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Amman"
+  },
+  "id": "quoteFollowUpV2R1",
+  "versionId": "e871331a-239b-43fe-bf22-dbe18c50f42c"
+}
